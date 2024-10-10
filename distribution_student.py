@@ -1,129 +1,228 @@
-""""
-Author: Adam Taheraly
-Aim: Repartition of student among the volunteers.
-Input: csv (separator: semicolon; digits: dot) with three column (Nom, Type, Presence).
-Output: List of student per volunteer
 """
-import pandas as pd
-from collections import defaultdict
+Author: Adam Taheraly
+Aim: Repartition of student among the volunteers (by wave)
+Input: csv (separator: semicolon; digits: dot) with four column (Name, Level, Presence, Priority, Autonomous).
+Output: List of student per volunteer (per wave)
+"""
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+import numpy as np
+import pandas as pd
 import time
-#import sys
 
+
+def filter_present(csv):
+    """
+    Filter out students and volunteers who are present from the list of people. Discriminate between the one associated
+    with the autonomous group if necessary.
+    """
+    # Filter present students and volunteers.
+    present_students = csv[(csv['Presence'] == 1) & (csv['Level'] != 'Volunteer')]
+    present_volunteers = csv[(csv['Presence'] == 1) & (csv['Level'] == 'Volunteer')]
+
+    # Discriminate the autonomous ones with the ones who are not.
+    present_students_autonomous = present_students[present_students["Autonomous"] == 1]
+    if not present_students_autonomous.empty:
+        present_students = pd.merge(present_students, present_students_autonomous, how='outer',
+                                    indicator=True).query("_merge != 'both'").drop('_merge',
+                                                                                   axis=1).reset_index(drop=True)
+
+        present_volunteer_autonomous = present_volunteers.sample(n=1, replace=False)
+        present_volunteers = pd.merge(present_volunteers, present_volunteer_autonomous, how='outer',
+                                      indicator=True).query("_merge != 'both'").drop('_merge',
+                                                                                     axis=1).reset_index(drop=True)
+    else:
+        present_students_autonomous = pd.DataFrame()
+        present_volunteer_autonomous = pd.DataFrame()
+
+    return present_students, present_students_autonomous, present_volunteers, present_volunteer_autonomous
+
+
+class GroupingStudentsByVolunteers:
+
+    def __init__(self, students, volunteers):
+        self.students = students
+        self.volunteers = volunteers
+        self.nb_students = len(self.students)
+        self.nb_volunteers = len(self.volunteers)
+
+    def generate_groups(self):
+        """
+        Generate a DataFrame indicating the repartition of students among volunteers
+        """
+
+        def _distribute_students(students):
+            """
+            Function to distribute students between groups of similar level.
+            """
+            groups = []
+            for _, group in students.groupby('Group'):
+                groups.append(group)
+            for student in students.itertuples():
+                groups.sort(key=lambda x: len(x))
+
+                smallest_group = groups[0]
+                smallest_group = pd.concat([smallest_group, pd.DataFrame([student])], ignore_index=True)
+                groups[0] = smallest_group
+            return groups
+
+        # Group students by level
+        students_by_level = self.students.groupby('Level')
+        # Create groups for each level
+        groups = []
+        students_copy = self.students.copy(deep=True)
+        students_copy['Group'] = [i % self.nb_students for i in range(self.nb_students)]
+        for _, _ in students_by_level:
+            groups.extend(_distribute_students(students_copy))
+
+        # Associate each group to a volunteer
+        groups = [group.dropna() for group in groups]
+        groups = pd.concat(groups).drop_duplicates(keep="first")
+        assigned_volunteers = []
+        for row in groups.itertuples(index=True, name='Pandas'):
+            i = getattr(row, "Group")
+            assigned_volunteers.append(self.volunteers.iloc[i % self.nb_volunteers]['Name'])
+        groups["Volunteer"] = assigned_volunteers
+
+        # Construct a DataFrame with name of rows and columns
+        df_groups = pd.DataFrame(index=groups["Name"], columns=groups.Volunteer.sort_values().unique(), dtype=int)
+        df_groups.insert(0, "Level", list(groups.Level))
+
+        # Fill the DataFrame with 1 for existing values
+        for Name, Volunteer in zip(groups.Name, groups.Volunteer):
+            df_groups.at[Name, Volunteer] = 1
+
+        # Formatting of the DataFrame
+        df_groups = df_groups.replace(np.nan, '', regex=True)
+        df_groups = df_groups.reset_index()
+
+        return df_groups
+
+
+class PdfOutput:
+    """
+    Construct a pdf file containing tables 
+    """
+    def __init__(self):
+        pass
+
+    def dimension(self, width=8.27, height=11.69):
+        """
+        Construct a figure of defined dimension (in inches)
+        """
+        fig, ax = plt.subplots(figsize=(width, height))
+        return fig, ax
+
+    def table(self, dataframe, title, color="black", ):
+        """
+        Convert DataFrame in formatted table for export
+        """
+        # Color cell containing 1 in red
+        colors = [[color if val == 1 else 'white' for val in row] for row in dataframe.values]
+
+        # Suppress labels of axes
+        ax.axis('tight')
+        ax.axis('off')
+
+        # Adjust the column width
+        col_widths = [0.2] + [0.11] * (len(dataframe.columns) - 1)
+
+        # Construct the table
+        table = ax.table(cellText=dataframe.values,  # df.values
+                         colLabels=dataframe.columns.tolist(),  # Include column names (df.columns.tolist())
+                         cellColours=colors,
+                         colWidths=col_widths,  # Define columns width
+                         cellLoc='center',  # Center text in cells
+                         loc='center')
+        # Adjust the font size
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        plt.title(title)
+        plt.close()
+
+    def output(self, figs):
+        """
+        Create pdf file with one figure per page
+        """
+        # Save in a pdf file
+        daystr = time.strftime("%Y%m%d")
+        filename = "repartition_student_" + daystr + ".pdf"
+        with PdfPages(filename) as pdf:
+            for fig in figs:
+                pdf.savefig(fig, bbox_inches='tight')
 
 
 # open CSV file
-#file_name = sys.argv[1]
-data = pd.read_csv("liste_presence.csv", sep = ";")
-#data = pd.read_csv("presence.csv")
+data = pd.read_csv("list_presence.csv", sep=";")
 
+# Initialize PDF export
+figs, ax = [], []
+output = PdfOutput()
 
-# Filter present students and volunteers.
-eleves_presents = data[(data['présent'] == 1) & (data['niveau'] != 'Bénévole')]
-benevoles_presents = data[(data['présent'] == 1) & (data['niveau'] == 'Bénévole')]
+# Filter present peoples and autonomous ones
+students, students_autonomous, volunteers, volunteer_autonomous = filter_present(data)
 
+# Construct tables with 2 waves if needed else only one
+if any(data["Priority"]):
+    # Identify the number of students by wave
+    nb_students_by_wave = len(students) // 2
 
-# Count the total number of present volunteers.
-nb_benevoles = len(benevoles_presents)
+    # get students of the first wave
+    students_with_priority = students[(students['Priority'] == 1)]
+    if len(students_with_priority) < nb_students_by_wave:
+        # Get priority student and complete wave with other remaining student
+        nb_slots_remaining = nb_students_by_wave - len(students_with_priority)
+        remaining_students = pd.merge(students_with_priority, students, how='outer',
+                                      indicator=True).query("_merge != 'both'").drop('_merge',
+                                                                                     axis=1).reset_index(drop=True)
+        selected_supplementary_students = remaining_students.sample(n=nb_slots_remaining, replace=False)
+        students_first_wave = pd.concat([students_with_priority, selected_supplementary_students])
+    else:
+        # Get priority student
+        students_first_wave = students_with_priority
 
-# Count the total number of present students.
-nb_eleves = len(eleves_presents)
+    # create group for student wave 1
+    first_wave = GroupingStudentsByVolunteers(students_first_wave, volunteers)
+    df_first_wave = first_wave.generate_groups()
 
-# Count the number of student per volunteer
-nb_eleves_par_groupe = nb_eleves // nb_benevoles
+    # get students of the second wave
+    students_second_wave = pd.merge(students, students_first_wave, how='outer',
+                                    indicator=True).query("_merge != 'both'").drop('_merge',
+                                                                                   axis=1).reset_index(drop=True)
 
-# Construct groups per level.
-groupes_par_niveau = eleves_presents.groupby('niveau')
+    # create group for student wave 2
+    second_wave = GroupingStudentsByVolunteers(students_second_wave, volunteers)
+    df_second_wave = second_wave.generate_groups()
 
-# Function to distribute students between groups of similar level.
-def repartir_dans_groupes(eleves, nb_eleves_par_groupe):
-    groupes = []
-    for _, groupe in eleves.groupby('groupe'):
-        groupes.append(groupe)
-    for eleve in eleves.itertuples():
-        groupes.sort(key=lambda x: len(x))
-        groupe_plus_petit = groupes[0]
-        groupe_plus_petit = pd.concat([groupe_plus_petit, pd.DataFrame([eleve])], ignore_index=True)
-        groupes[0] = groupe_plus_petit
-    return groupes
+    # generate output with table of wave 1 and 2
+    fig, ax = output.dimension()
+    output.table(df_first_wave, "Grouping for the first wave")
+    figs.append(fig)
 
+    fig, ax = output.dimension()
+    output.table(df_second_wave, "Grouping for the second wave")
+    figs.append(fig)
 
-# Count the number of needed groups
-nb_groupes = nb_benevoles
+else:
+    # create group of student
+    general_grouping = GroupingStudentsByVolunteers(students, volunteers)
+    df_general_grouping = general_grouping.generate_groups()
 
-# Create groups for each level
-groupes = []
-for niveau, eleves in groupes_par_niveau:
-    # Count the number of student per group
-    nb_eleves_par_groupe = len(eleves) // nb_groupes
-    eleves['groupe'] = [i % nb_eleves for i in range(len(eleves))]
-    groupes.extend(repartir_dans_groupes(eleves, nb_eleves_par_groupe))
+    # generate output with table
+    fig, ax = output.dimension()
+    output.table(df_general_grouping, "Grouping without priority students")
+    figs.append(fig)
 
-# Associate each group to a volunteer
-for i, groupe in enumerate(groupes):
-    groupe['Bénévole'] = benevoles_presents.iloc[i % nb_benevoles]['nom']
+# Construct a table for the autonomous group if needed
+if not students_autonomous.empty:
+    df = pd.DataFrame(index=students_autonomous.Name, columns=volunteer_autonomous.Name, dtype=int)
+    df[volunteer_autonomous.Name] = 1
+    df = df.reset_index()
 
-benevole = defaultdict(list)
-for groupe in groupes:
-    benevole[groupe["Bénévole"][0]].append((groupe["nom"][0],groupe["niveau"][0]))
+    fig, ax = output.dimension()
+    output.table(df, 'Autonomous student')
+    figs.append(fig)
 
-## Recover unique value
-valeurs_uniques = sorted(set(val for sublist in benevole.values() for val in sublist))
-
-# Construct a DataFrame with name of rows and columns 
-df = pd.DataFrame(index=valeurs_uniques, columns=benevole.keys(), dtype=int)
-
-# Fill the DataFrame with 1 for existing values
-for groupe, membres in benevole.items():
-    df[groupe] = df.index.isin(membres).astype(int)
-
-# Add column with name of students
-names = [name for name, niveau in df.index]  # Recover student names
-niveau = [niveau for name, niveau in df.index]
-df['Noms'] = names  # Add the name column
-df['Niveau'] = niveau  # Add the level column
-df.insert(0, 'Niveau', df.pop('Niveau'))
-df.insert(0, 'Noms', df.pop('Noms'))
-
-# Construct a figure of A4 page dimension (in inches)
-fig_width = 8.27  # Largeur du papier A4 en pouces
-fig_height = 11.69  # Hauteur du papier A4 en pouces
-fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-# Color cell containing 1 in red
-colors = [['red' if val == 1 else 'white' for val in row] for row in df.values]
-# Suppress labes of axes
-ax.axis('tight')
-ax.axis('off')
-
-# Adjust the column width
-col_widths = [0.2]+ [0.11] * (len(df.columns) - 1)
-
-# Construct the table
-table = ax.table(cellText=df.values,
-                 colLabels=df.columns.tolist(),  # Inclure les noms des colonnes
-                 cellColours=colors,
-                 colWidths=col_widths,  # Définir la largeur des colonnes
-                 cellLoc='center',  # Aligner le texte au centre des cellules
-                 loc='center')
-
-# Adjust the font size
-table.auto_set_font_size(False)
-table.set_fontsize(8)
-table.set
-
-# Save in a pdf file
-daystr = time.strftime("%Y%m%d")
-filename = "repartition_eleve_" + daystr + ".pdf"
-with PdfPages(filename) as pdf:
-    pdf.savefig(fig, bbox_inches='tight')
-
-plt.close(fig)
-"""for key, value in benevole.items():
-    print(key)
-    list = []
-    for val in value:
-        list.append(val[1])
-        print(val[0], val[1])
-    print(Counter(list))"""
+# Generate PDF export
+output.output(figs)
